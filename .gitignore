@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Thinkprint runtime artifacts
+*.thinkprint.db
+thinkprint.md
+.thinkprint/
+output/
+
+# Secrets
+.env
+.env.local
+*.key
+
+# OS
+Thumbs.db
