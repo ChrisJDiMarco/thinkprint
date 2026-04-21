@@ -1,13 +1,16 @@
 """Thinkprint CLI.
 
-Three commands:
+Commands:
 
-  thinkprint extract  --claude-dir ~/.claude --project . --chatgpt-export <path> --claude-export <path>
-  thinkprint show     [--topic ...] [--limit N]
-  thinkprint serve    [--db <path>]
+  thinkprint interview                              # primary — runs Q&A, writes thinkprint.md
+  thinkprint interview --answers answers.json       # batch mode (non-interactive)
+  thinkprint extract   --claude-dir ~/.claude ...   # seed-only: scrapes configs into rules
+  thinkprint show      [--topic ...] [--limit N]
+  thinkprint topics
+  thinkprint serve     [--db <path>]
 
-The CLI is intentionally narrow. Anything fancier (publishing, sanitizer, swipe UI) is
-deliberately not in this MVP.
+A Thinkprint is built through structured Q&A elicitation, not extraction alone.
+`extract` is a seed step; `interview` is the product.
 """
 
 from __future__ import annotations
@@ -20,12 +23,20 @@ from rich.console import Console
 from rich.table import Table
 
 from thinkprint import __version__
+from thinkprint.interview import (
+    load_answers,
+    run_batch,
+    run_interactive,
+    save_transcript,
+)
 from thinkprint.output import render_markdown
 from thinkprint.pipeline import run_extraction
 from thinkprint.storage import list_topics, load_rules, save_rules
+from thinkprint.synthesis import write_thinkprint
 
 DEFAULT_DB = Path.cwd() / ".thinkprint" / "thinkprint.db"
 DEFAULT_MD = Path.cwd() / "thinkprint.md"
+DEFAULT_TRANSCRIPT = Path.cwd() / ".thinkprint" / "interview.json"
 
 console = Console()
 
@@ -121,6 +132,110 @@ def extract(
             "\n[yellow]Tip:[/yellow] no chat exports given and no config files found. "
             "Run with --chatgpt-export and/or --claude-export to capture Tier 2 rules."
         )
+
+
+@cli.command()
+@click.option(
+    "--claude-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Path to your ~/.claude directory (optional — used as seed context).",
+)
+@click.option(
+    "--project",
+    "project_dirs",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Project root(s) to scan for CLAUDE.md / .cursorrules (seed context).",
+)
+@click.option(
+    "--answers",
+    "answers_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Batch mode: JSON file of {question_id: answer} — skip interactive prompts.",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_MD,
+    show_default=True,
+    help="Thinkprint markdown output path.",
+)
+@click.option(
+    "--transcript",
+    "transcript_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_TRANSCRIPT,
+    show_default=True,
+    help="Where to save the raw interview transcript JSON.",
+)
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB,
+    show_default=True,
+    help="SQLite DB for seed rules.",
+)
+@click.option(
+    "--label",
+    default="Thinkprint",
+    show_default=True,
+    help="Title for the generated markdown (e.g. 'Thinkprint: Chris D.').",
+)
+def interview(
+    claude_dir: Path | None,
+    project_dirs: tuple[Path, ...],
+    answers_path: Path | None,
+    out_path: Path,
+    transcript_path: Path,
+    db_path: Path,
+    label: str,
+) -> None:
+    """Run the Thinkprint Q&A interview and write the synthesized profile.
+
+    The interview is the primary way to build a Thinkprint. Seed extraction
+    from config files is used only to prime implicit observations.
+    """
+    console.print(f"[bold cyan]Thinkprint[/bold cyan] — interview · {label}")
+
+    # 1. Gather seed rules (silent — extraction is a pre-step, not the output).
+    seed_rules, _stats = run_extraction(
+        claude_dir=claude_dir,
+        project_dirs=list(project_dirs),
+        chatgpt_export=None,
+        claude_export=None,
+        use_llm=False,
+    )
+    if seed_rules:
+        save_rules(db_path, seed_rules, replace=True)
+        console.print(f"[dim]Seed context:[/dim] {len(seed_rules)} rules from configs")
+
+    # 2. Run the interview — batch or interactive.
+    if answers_path:
+        answers = load_answers(answers_path)
+        transcript = run_batch(answers, seed_rules)
+        console.print(f"[dim]Batch interview:[/dim] {len(transcript.rounds)} rounds")
+    else:
+        transcript = run_interactive(seed_rules)
+
+    save_transcript(transcript, transcript_path)
+
+    # 3. Synthesize the profile and write markdown.
+    final_path = write_thinkprint(
+        transcript,
+        seed_rules,
+        out_path,
+        user_label=label,
+    )
+
+    console.print()
+    console.print("[bold green]Thinkprint written.[/bold green]")
+    console.print(f"[dim]Profile:[/dim] {final_path}")
+    console.print(f"[dim]Transcript:[/dim] {transcript_path}")
+    console.print(f"[dim]Seed DB:[/dim] {db_path}")
 
 
 @cli.command()
