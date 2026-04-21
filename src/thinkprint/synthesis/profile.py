@@ -1,12 +1,13 @@
 """Profile synthesizer — turns an interview transcript into a Thinkprint.
 
-The output is a structured markdown document with six sections:
+The output is a structured markdown document with seven sections:
   1. Identity
   2. Explicit preferences (from interview answers)
   3. Implicit patterns (from seed rules + answer tone)
   4. Preferred formats
   5. Working style
-  6. Interview transcript (verbatim, for auditability)
+  6. Contradictions (interview answer vs seed observation mismatches)
+  7. Interview transcript (verbatim, for auditability)
 
 Two paths:
 - If ANTHROPIC_API_KEY is set, call Claude once to draft the distilled
@@ -42,6 +43,7 @@ class SynthesisResult:
     implicit_patterns: str
     preferred_formats: str
     working_style: str
+    contradictions: str
     used_llm: bool
 
 
@@ -109,9 +111,13 @@ def render_thinkprint_md(
         "",
         result.working_style.strip(),
         "",
+        "## 6. Contradictions",
+        "",
+        result.contradictions.strip(),
+        "",
         "---",
         "",
-        "## 6. Interview transcript",
+        "## 7. Interview transcript",
         "",
         _render_transcript(transcript),
         "",
@@ -149,19 +155,61 @@ _SYSTEM_PROMPT = textwrap.dedent(
     observations from a user's config files, and you produce a distilled
     profile of how this user works.
 
-    Return strict JSON with exactly these keys, all strings, all markdown:
-      identity               — 2-4 sentence paragraph on who they are and what they're building
-      explicit_preferences   — bulleted list of preferences the user explicitly stated
-      implicit_patterns      — bulleted list of patterns observed from seed data + answer tone
-      preferred_formats      — bulleted list of format defaults (markdown, docx, pdf, etc)
-      working_style          — bulleted list describing how they like to work with an AI
+    ## What to look for
 
-    Rules:
-    - Never invent facts not grounded in the inputs.
-    - Distinguish "they said" (explicit) from "we observed" (implicit). Do not mix them.
-    - Use the user's own words when possible for explicit items.
-    - Keep each section under 10 bullets. Lead with the strongest signal.
-    - No trailing summaries, no meta-commentary, just the content.
+    Each bullet you write must fall into ONE of these axes. Tagging keeps the
+    profile load-bearing instead of vibes-y.
+
+      LENGTH       — how long should responses be, when to truncate
+      FORMALITY    — tone, voice, register, profanity tolerance
+      STRUCTURE    — prose vs bullets, leads with answer vs reasoning, summaries
+      FORMAT       — markdown/docx/pdf/html defaults, save locations, delivery norms
+      PLANNING     — plan-first vs jump-in, when to ask clarifying questions
+      CORRECTION   — how the user signals stop/continue, tolerance for pushback
+      TOOLS        — preferred apps, connectors, OS, integrations to prioritize
+      DOMAIN       — vocabulary, role, what they're building, stakeholders
+      SCOPE        — minimal vs expansive, touch-adjacent-files tolerance
+
+    ## Output schema
+
+    Return strict JSON with exactly these keys, all markdown strings:
+
+      identity              — 2-4 sentence paragraph on who they are, what they're
+                              building, and the outcome they're chasing
+      explicit_preferences  — bullets of preferences the user STATED. Prefix each
+                              bullet with its axis tag in brackets, e.g.
+                              "- [STRUCTURE] Lead with the answer, no preamble"
+      implicit_patterns     — bullets of patterns OBSERVED from seed data + answer
+                              tone. Same axis-tag prefix. Cite the source
+                              inline with parentheses, e.g. "(seed: CLAUDE.md)"
+                              or "(from answer tone: Communication)".
+      preferred_formats     — bullets on format defaults only. Axis-tag with [FORMAT].
+      working_style         — bullets on PLANNING / CORRECTION / SCOPE axes only.
+      contradictions        — bullets listing any case where an interview answer
+                              disagrees with a seed observation. Empty if none.
+                              Format: "- User said X, but seed shows Y (source)"
+
+    ## Confidence & grounding rules
+
+    - Only write a bullet when you can point to concrete evidence. If you had to
+      hedge with "may" or "might", drop it.
+    - Prefer the user's own words verbatim in explicit_preferences.
+    - Weight seed rules by their `evidence_count` (sent in the payload). A rule
+      with 5+ evidence turns is strong signal; a rule with 1 is weak.
+    - Each section max 10 bullets. Lead with the strongest signal.
+    - No trailing summaries, no meta-commentary, no "in conclusion".
+    - If you cannot find any evidence for a section, return an empty string for
+      that key — the caller will fill it from the template fallback.
+
+    ## Worked example (one bullet, for format reference)
+
+    Given answer: "Lead with the answer. No trailing summaries — I can read the
+    diff." and seed rule "terse: avoid preamble" (evidence_count=4):
+
+      explicit_preferences: "- [STRUCTURE] Lead with the answer; no trailing summaries (user said: 'I can read the diff')"
+      implicit_patterns:    "- [STRUCTURE] Avoids preamble across 4 seed turns (seed: config + chat history)"
+
+    Two bullets, two sources, one axis. That's the shape.
     """
 ).strip()
 
@@ -176,6 +224,9 @@ def _synthesize_with_llm(
     import anthropic  # type: ignore[import-not-found]
 
     client = anthropic.Anthropic(api_key=api_key)
+    # Send seed rules weighted — highest-evidence rules first so the model
+    # can lean on them when deciding which implicit patterns are load-bearing.
+    ranked_seeds = _rank_seed_rules(seed_rules)[:_MAX_SEED_RULES_FOR_LLM]
     user_payload = {
         "transcript": [
             {
@@ -187,8 +238,14 @@ def _synthesize_with_llm(
             for r in transcript.rounds
         ],
         "seed_rules_sample": [
-            {"topic": r.topic, "statement": r.statement, "tier": r.tier}
-            for r in seed_rules[:_MAX_SEED_RULES_FOR_LLM]
+            {
+                "topic": r.topic,
+                "statement": r.statement,
+                "tier": r.tier,
+                "confidence": r.confidence.value,
+                "evidence_count": len(r.evidence),
+            }
+            for r in ranked_seeds
         ],
     }
     message = client.messages.create(
@@ -219,7 +276,23 @@ def _synthesize_with_llm(
         or _fallback_formats(transcript),
         working_style=str(data.get("working_style", "")).strip()
         or _fallback_working(transcript),
+        contradictions=str(data.get("contradictions", "")).strip()
+        or _fallback_contradictions(),
         used_llm=True,
+    )
+
+
+def _rank_seed_rules(seed_rules: list[Rule]) -> list[Rule]:
+    """Sort seed rules by signal strength, strongest first.
+
+    Evidence count is the primary signal — a rule backed by 5 chat turns is
+    heavier than a rule extracted from one line of a config file. Tier is
+    secondary (Tier 2 rules came from chat clusters and are usually richer).
+    """
+    return sorted(
+        seed_rules,
+        key=lambda r: (len(r.evidence), r.tier),
+        reverse=True,
     )
 
 
@@ -261,6 +334,7 @@ def _synthesize_fallback(
     implicit = _fallback_implicit(transcript, seed_rules)
     formats = _fallback_formats(transcript)
     working = _fallback_working(transcript)
+    contradictions = _fallback_contradictions()
     if note:
         identity = f"{note}\n\n{identity}"
     return SynthesisResult(
@@ -269,6 +343,7 @@ def _synthesize_fallback(
         implicit_patterns=implicit,
         preferred_formats=formats,
         working_style=working,
+        contradictions=contradictions,
         used_llm=False,
     )
 
@@ -321,6 +396,14 @@ def _fallback_working(transcript: InterviewTranscript) -> str:
             if r.answer and r.answer != "(no answer provided)":
                 parts.append(f"- **{r.topic}:** {r.answer}")
     return "\n".join(parts) if parts else "_Not captured in interview._"
+
+
+def _fallback_contradictions() -> str:
+    """Template fallback can't reason about contradictions — flag the gap."""
+    return (
+        "_Template fallback — contradictions between interview answers and "
+        "seed observations are not detected without an LLM pass._"
+    )
 
 
 # ---------------------------------------------------------------------

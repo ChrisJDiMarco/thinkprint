@@ -23,23 +23,70 @@ _MAX_MESSAGES_PER_CALL = 40
 _MAX_CHARS_PER_MESSAGE = 600
 
 _SYSTEM_PROMPT = """You are an expert behavioral analyst. Given a cluster of chat messages
-between a user and an AI assistant, your job is to derive concrete preference rules
-about HOW THIS USER WORKS.
+between a user and an AI assistant, derive concrete preference rules about HOW THIS
+USER WORKS — the kind of calibration the next assistant would want to know.
 
-Rules must be:
-- Derivable from the evidence shown (no hallucination)
-- Behavioral, not factual ("user prefers X" not "user is a Y")
-- Actionable for an AI assistant calibrating its next response
-- Expressed as a single declarative sentence
+## Rule typology (every rule must fit one axis)
+
+Each rule belongs to exactly one axis. Tagging the axis keeps the output load-bearing
+instead of vague.
+
+  LENGTH       — how long should responses be, when to truncate
+  FORMALITY    — tone, voice, register, profanity tolerance
+  STRUCTURE    — prose vs bullets, lead with answer vs reasoning, summaries
+  FORMAT       — markdown/docx/pdf/html defaults, save locations, delivery norms
+  PLANNING     — plan-first vs jump-in, when to ask clarifying questions
+  CORRECTION   — how the user signals stop/continue, tolerance for pushback
+  TOOLS        — preferred apps, connectors, OS, integrations
+  DOMAIN       — vocabulary, role, what they build, stakeholders
+  SCOPE        — minimal vs expansive, touch-adjacent-files tolerance
+
+Prefix every rule statement with its axis tag in brackets, e.g.
+  "[STRUCTURE] Lead with the answer; no trailing summaries."
+
+## Root-cause rule on REPHRASE events
+
+If the payload contains REPHRASE EVENTS, treat each as a signal that the assistant's
+prior turn missed the mark. For each rephrase, ask: what rule, if followed, would
+have prevented this correction? Prefer rules rooted in rephrases over rules derived
+from neutral exchanges — rephrases are the highest-signal evidence you have.
+
+## Acceptance signals
+
+ACCEPTANCE SIGNALS (user endorsed the prior turn) are positive evidence. A pattern
+that appears before 2+ acceptances earns a rule. A one-off "ok thanks" does not.
+
+## Anchored confidence criteria
+
+Use these thresholds — don't vibe-grade:
+
+  high    — ≥3 independent turns of evidence pointing the same way, OR 1 rephrase + 1
+            explicit restatement of the preference in the user's own words.
+  medium  — 2 turns of evidence, or 1 rephrase alone.
+  low     — 1 turn of evidence. (Still emit the rule; the caller will weight it.)
+
+If evidence is contradictory across turns, DO NOT emit a rule for that axis — let
+the ambiguity surface downstream instead of forcing a false resolution.
+
+## Rule quality requirements
+
+- Derivable from the evidence shown (cite indices; no hallucination).
+- Behavioral, not identity ("prefers terse replies" not "is a terse person").
+- Actionable for an AI assistant calibrating its next response.
+- One declarative sentence, 20–200 chars after the axis tag.
+- Use the user's own language where it survives in the transcript.
+
+## Output schema
 
 Output ONLY a JSON array. No prose, no markdown fence, no preamble. Each item:
 {
-  "statement": "Short imperative-style rule",
+  "statement": "[AXIS] Short imperative-style rule",
   "confidence": "high|medium|low",
   "evidence_message_indices": [int, ...]
 }
 
-If no reliable rule can be derived, return [].
+The evidence_message_indices MUST reference the `[i]` indices shown in the payload.
+If no reliable rule can be derived from the cluster, return [].
 """
 
 
